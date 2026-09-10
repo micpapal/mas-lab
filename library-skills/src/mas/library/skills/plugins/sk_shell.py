@@ -81,6 +81,14 @@ class RunSkillScriptPlugin(ToolContract):
                                 "LD_PRELOAD, etc.) are rejected."
                             ),
                         },
+                        "stdin": {
+                            "type": "string",
+                            "description": (
+                                "Text to feed to the script's stdin (optional). Use this "
+                                "for a script documented as reading a reply from stdin — "
+                                "passing text via `args` or `env` never reaches it."
+                            ),
+                        },
                     },
                     "required": ["skill", "script"],
                 },
@@ -106,6 +114,7 @@ class RunSkillScriptPlugin(ToolContract):
             args = require_str_list_arg(arguments, "args")
             env = require_dict_arg(arguments, "env")
             timeout = min(require_number_arg(arguments, "timeout", _DEFAULT_TIMEOUT), _MAX_TIMEOUT)
+            stdin = require_str_arg(arguments, "stdin")
         except TypeError as exc:
             return {"error": str(exc)}
         return self._run_script(
@@ -114,6 +123,7 @@ class RunSkillScriptPlugin(ToolContract):
             args=args,
             timeout=timeout,
             extra_env=sanitize_extra_env(env),
+            stdin=stdin,
             registry=registry,
             backend_plugin=backend_plugin,
         )
@@ -130,6 +140,7 @@ class RunSkillScriptPlugin(ToolContract):
         extra_env: dict[str, str],
         registry: SkillRegistry | None,
         backend_plugin: Any | None,
+        stdin: str = "",
     ) -> dict[str, Any]:
         if not skill:
             return {"error": "skill is required"}
@@ -199,6 +210,7 @@ class RunSkillScriptPlugin(ToolContract):
                 cwd=record.base_dir,
                 timeout=timeout,
                 env_extra=extra_env,
+                stdin=stdin,
             )
         except Exception as exc:
             return {"error": f"Cannot run script {script!r} for skill {skill!r}: {exc}"}

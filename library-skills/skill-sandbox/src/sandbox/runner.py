@@ -56,6 +56,7 @@ def run_script(
     cwd: Path | None = None,
     timeout: int | None = None,
     env_extra: dict[str, str] | None = None,
+    stdin: str = "",
 ) -> ScriptResult:
     """Execute a script in a sandboxed subprocess.
 
@@ -65,6 +66,11 @@ def run_script(
         cwd: Working directory (default: script's parent directory).
         timeout: Execution timeout in seconds (default: 30, max: 120).
         env_extra: Additional environment variables (merged after safe base).
+        stdin: Text to feed to the script's stdin. Always passed through as
+            subprocess.run's `input=`, even when empty — this closes stdin
+            with an immediate EOF rather than leaving it to inherit this
+            process's own stdin, which never produces data or EOF here and
+            would leave any script that reads stdin blocked until timeout.
 
     Returns:
         ScriptResult with exit_code, stdout, stderr, ok fields.
@@ -99,6 +105,7 @@ def run_script(
     try:
         result = subprocess.run(
             cmd,
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=timeout_val,
