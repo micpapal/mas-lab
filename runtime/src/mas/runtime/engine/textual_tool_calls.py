@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -29,6 +30,42 @@ _MERGED_ARG_KEY_RE = re.compile(
     r"^(?P<first_key>[A-Za-z_][A-Za-z0-9_]*)=(?P<first_value>.*),(?P<second_key>[A-Za-z_][A-Za-z0-9_]*)$",
     re.DOTALL,
 )
+
+
+@dataclass(frozen=True)
+class _ParamSchema:
+    """Per-tool parameter shape used to resolve bare positional arguments."""
+
+    order: tuple[str, ...] = ()
+    enums: dict[str, frozenset[Any]] = field(default_factory=dict)
+
+
+def _build_tool_schemas(tool_defs: list[dict[str, Any]]) -> dict[str, _ParamSchema]:
+    """Extract declared parameter order + enum constraints per tool name.
+
+    Used only to resolve bare positional arguments (see
+    ``_resolve_positional_args``) -- never to validate or reject a call.
+    """
+    schemas: dict[str, _ParamSchema] = {}
+    for tool_def in tool_defs:
+        if not isinstance(tool_def, dict):
+            continue
+        fn = tool_def.get("function")
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        params = fn.get("parameters")
+        if not isinstance(name, str) or not isinstance(params, dict):
+            continue
+        properties = params.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        enums: dict[str, frozenset[Any]] = {}
+        for prop_name, prop_schema in properties.items():
+            if isinstance(prop_schema, dict) and isinstance(prop_schema.get("enum"), list):
+                enums[prop_name] = frozenset(prop_schema["enum"])
+        schemas[name] = _ParamSchema(order=tuple(properties.keys()), enums=enums)
+    return schemas
 
 
 def repair_merged_arg_keys(args: dict[str, Any]) -> dict[str, Any]:
@@ -64,31 +101,39 @@ def recover_tool_calls_from_content(
     content: str | None,
     *,
     known_tool_names: set[str] | None = None,
+    tool_schemas: dict[str, _ParamSchema] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Recover structured tool calls from message content, plus the leftover text."""
     raw = str(content or "")
     cleaned = strip_channel_markup(raw)
     blocks = _TEXT_TOOL_CALL_BLOCK_RE.findall(raw)
     variables = _collect_text_variables(cleaned)
+    tool_schemas = tool_schemas or {}
     tool_calls: list[dict[str, Any]] = []
 
     for idx, item in enumerate(blocks or ([raw] if cleaned.startswith("call:") else []), start=1):
         match = _TEXT_TOOL_CALL_RE.match(item.strip())
         if match:
-            args = _parse_textual_tool_call_args(match.group("args"), variables=variables)
-            tool_calls.append(_as_tool_call(idx, match.group("name"), args))
+            name = match.group("name")
+            args = _parse_textual_tool_call_args(
+                match.group("args"), variables=variables, param_schema=tool_schemas.get(name)
+            )
+            tool_calls.append(_as_tool_call(idx, name, args))
 
     if not tool_calls:
         for line in cleaned.splitlines():
             match = _BARE_TOOL_CALL_RE.match(line.strip())
             if match:
-                args = _parse_textual_tool_call_args(match.group("args"), variables=variables)
-                tool_calls.append(_as_tool_call(len(tool_calls) + 1, match.group("name"), args))
+                name = match.group("name")
+                args = _parse_textual_tool_call_args(
+                    match.group("args"), variables=variables, param_schema=tool_schemas.get(name)
+                )
+                tool_calls.append(_as_tool_call(len(tool_calls) + 1, name, args))
 
     if not tool_calls and known_tool_names:
         spans: list[tuple[int, int]] = []
         for name, args_raw, start, end in _find_multiline_bare_calls(cleaned, known_names=known_tool_names):
-            args = _parse_textual_tool_call_args(args_raw, variables=variables)
+            args = _parse_textual_tool_call_args(args_raw, variables=variables, param_schema=tool_schemas.get(name))
             tool_calls.append(_as_tool_call(len(tool_calls) + 1, name, args))
             spans.append((start, end))
         for start, end in sorted(spans, reverse=True):
@@ -117,6 +162,7 @@ def maybe_recover_textual_tool_calls(
     tool_calls, recovered_text = recover_tool_calls_from_content(
         message.get("content"),
         known_tool_names=known_tool_names,
+        tool_schemas=_build_tool_schemas(tool_defs),
     )
     # Strip channel markup even when no tool call was recovered -- some backends
     # emit it on plain answers too, and it must never reach the user.
@@ -127,6 +173,7 @@ def _parse_textual_tool_call_args(
     raw: str,
     *,
     variables: dict[str, Any] | None = None,
+    param_schema: _ParamSchema | None = None,
 ) -> dict[str, Any]:
     variables = variables or {}
     stripped = raw.strip()
@@ -139,6 +186,11 @@ def _parse_textual_tool_call_args(
     for name, value in variables.items():
         payload = re.sub(rf"\b{re.escape(name)}\b", json.dumps(value), payload)
     payload = payload.replace("=", ":")
+
+    placeholder_order: list[str] = []
+    if not payload.startswith("{"):
+        payload, placeholder_order = _neutralize_bare_positional_args(payload)
+
     payload = re.sub(
         r"(^|[,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:",
         lambda m: f'{m.group(1)}"{m.group(2)}": ',
@@ -150,7 +202,108 @@ def _parse_textual_tool_call_args(
         loaded = yaml.safe_load(payload)
     except Exception:
         return {"raw": raw}
-    return dict(loaded) if isinstance(loaded, dict) else {"raw": raw}
+    if not isinstance(loaded, dict):
+        return {"raw": raw}
+    if placeholder_order:
+        return _resolve_positional_args(loaded, placeholder_order, param_schema)
+    return dict(loaded)
+
+
+def _split_top_level_args(payload: str) -> list[str]:
+    """Split ``a, b: 1, "c, d"`` on top-level commas -- quotes/brackets aware."""
+    parts: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = 0
+    i = 0
+    n = len(payload)
+    while i < n:
+        ch = payload[i]
+        if quote:
+            if ch == "\\" and i + 1 < n:
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(payload[start:i])
+            start = i + 1
+        i += 1
+    parts.append(payload[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+_KEYED_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*:")
+
+
+def _neutralize_bare_positional_args(payload: str) -> tuple[str, list[str]]:
+    """Rewrite bare positional segments (e.g. ``blocking_queries``) as
+    ``__posN__: blocking_queries`` placeholder key/value pairs.
+
+    Without this, a comma-separated segment with no ``key:``/``key=`` prefix
+    reaches ``yaml.safe_load`` wrapped in ``{...}``, and YAML's flow-mapping
+    shorthand for a bare word silently turns it into ``{"blocking_queries":
+    None}`` -- the argument's intended VALUE ends up as a phantom dict key
+    mapped to null, instead of landing on the right parameter. The
+    placeholders are resolved back onto real parameter names afterwards by
+    ``_resolve_positional_args``.
+    """
+    segments = _split_top_level_args(payload)
+    if not segments:
+        return payload, []
+    placeholder_order: list[str] = []
+    rebuilt: list[str] = []
+    for segment in segments:
+        if _KEYED_SEGMENT_RE.match(segment):
+            rebuilt.append(segment)
+            continue
+        placeholder = f"__pos{len(placeholder_order)}__"
+        placeholder_order.append(placeholder)
+        rebuilt.append(f"{placeholder}: {segment}")
+    return ", ".join(rebuilt), placeholder_order
+
+
+def _resolve_positional_args(
+    loaded: dict[str, Any],
+    placeholder_order: list[str],
+    param_schema: _ParamSchema | None,
+) -> dict[str, Any]:
+    """Map ``__posN__`` placeholders onto real parameter names, in order.
+
+    Prefers a parameter whose declared ``enum`` contains the value (so a
+    bare ``blocking_queries`` lands on ``query_type``, not on whatever
+    parameter happens to be first), then falls back to the next declared
+    parameter not already supplied by a keyed argument in this same call.
+    With no schema at all, falls back to the pre-existing ``value``/
+    ``value1``/... convention used elsewhere in this module for a bare
+    argument -- never back to the silent ``{token: None}`` shape.
+    """
+    resolved: dict[str, Any] = {k: v for k, v in loaded.items() if k not in placeholder_order}
+    used = set(resolved)
+    order = param_schema.order if param_schema else ()
+    enums = param_schema.enums if param_schema else {}
+    fallback = 0
+    for placeholder in placeholder_order:
+        if placeholder not in loaded:
+            continue
+        value = loaded[placeholder]
+        target = next(
+            (name for name, values in enums.items() if name not in used and value in values),
+            None,
+        )
+        if target is None:
+            target = next((name for name in order if name not in used), None)
+        if target is None:
+            target = "value" if fallback == 0 else f"value{fallback}"
+            fallback += 1
+        resolved[target] = value
+        used.add(target)
+    return resolved
 
 
 def _collect_text_variables(content: str) -> dict[str, Any]:
